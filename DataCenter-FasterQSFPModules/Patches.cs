@@ -43,6 +43,140 @@ namespace MoreSFPModules
     }
 
     // =========================================================================
+    // Patch: ComputerShop.ButtonBuyShopItem (Prefix)
+    // Adds custom shop items to the cart. The game's regular ButtonBuyShopItem
+    // path silently rejects custom item IDs before it reaches GetPrefabForItem,
+    // so these IDs use the lower-level spawn + ShopCartItem flow directly.
+    // =========================================================================
+    [HarmonyPatch(typeof(ComputerShop), nameof(ComputerShop.ButtonBuyShopItem))]
+    internal static class PatchButtonBuyShopItem
+    {
+        private static bool Prefix(ComputerShop __instance, int itemID, int price,
+                                   PlayerManager.ObjectInHand itemType, string displayName,
+                                   bool isCustomColor)
+        {
+            if ((itemID >= Core.MOD_ID_BASE && itemID < Core.MOD_ID_BASE + ModuleList.All.Length) ||
+                (itemID >= Core.BULK_ID_BASE && itemID < Core.BULK_ID_BASE + ModuleList.All.Length))
+            {
+                int before = __instance.cartUIItems != null ? __instance.cartUIItems.Count : -1;
+                MelonLogger.Msg($"Buy clicked: itemID={itemID}, type={(int)itemType}, " +
+                                $"price={price}, customColor={isCustomColor}, name='{displayName}'");
+
+                bool added = AddCustomItemToCart(__instance, itemID, price, itemType, displayName);
+
+                int after = __instance.cartUIItems != null ? __instance.cartUIItems.Count : -1;
+                MelonLogger.Msg($"Custom cart add: success={added}, before={before}, after={after}, " +
+                                $"currentPrice={__instance.currentPrice}");
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool AddCustomItemToCart(ComputerShop shop, int itemID, int price,
+                                                PlayerManager.ObjectInHand itemType,
+                                                string displayName)
+        {
+            var prefab = BuildCartPrefab(itemID, itemType);
+            if (prefab == null)
+            {
+                MelonLogger.Error($"No prefab for custom cart itemID={itemID}, type={(int)itemType}.");
+                return false;
+            }
+
+            if (shop.shopCartItemPrefab == null || shop.parentForShopCartItems == null ||
+                shop.cartUIItems == null)
+            {
+                MelonLogger.Error("Shop cart UI references missing.");
+                return false;
+            }
+
+            var spawnedUID = shop.SpawnPhysicalItem(prefab, price, itemType);
+            if (!spawnedUID.HasValue)
+            {
+                MelonLogger.Error($"SpawnPhysicalItem failed for custom itemID={itemID}.");
+                return false;
+            }
+
+            int uid = spawnedUID.Value;
+            var existingCartItem = FindExistingCartItem(shop, itemID, itemType);
+            if (existingCartItem != null)
+            {
+                existingCartItem.AddSpawnedItem(uid);
+                shop.UpdateCartTotal();
+                MelonLogger.Msg($"Custom cart quantity increased: itemID={itemID}, uid={uid}, " +
+                                $"quantity={existingCartItem.Quantity}");
+                return true;
+            }
+
+            var cartObject = Object.Instantiate(shop.shopCartItemPrefab,
+                                                shop.parentForShopCartItems, false);
+            var cartItem = cartObject.GetComponent<ShopCartItem>();
+            if (cartItem == null)
+            {
+                Object.Destroy(cartObject);
+                shop.RemoveSpawnedItem(uid);
+                MelonLogger.Error("ShopCartItem component missing on cart prefab clone.");
+                return false;
+            }
+
+            var noCustomColor = new Il2CppSystem.Nullable<Color>();
+            cartItem.Initialize(shop, displayName, itemID, price, itemType, uid, noCustomColor);
+            shop.cartUIItems.Add(cartItem);
+            shop.UpdateCartTotal();
+
+            MelonLogger.Msg($"Custom cart item created: itemID={itemID}, uid={uid}, " +
+                            $"quantity={cartItem.Quantity}");
+            return true;
+        }
+
+        private static ShopCartItem FindExistingCartItem(ComputerShop shop, int itemID,
+                                                         PlayerManager.ObjectInHand itemType)
+        {
+            if (shop.cartUIItems == null) return null;
+
+            foreach (var cartItem in shop.cartUIItems)
+            {
+                if (cartItem == null) continue;
+                if (cartItem.ItemID == itemID && cartItem.ItemType == itemType)
+                    return cartItem;
+            }
+
+            return null;
+        }
+
+        private static GameObject BuildCartPrefab(int itemID, PlayerManager.ObjectInHand itemType)
+        {
+            var mgm = MainGameManager.instance;
+            if (mgm == null) return null;
+
+            Transform templateParent = Core.TemplateHolder != null
+                ? Core.TemplateHolder.transform
+                : null;
+
+            if (itemID >= Core.BULK_ID_BASE &&
+                itemID < Core.BULK_ID_BASE + ModuleList.All.Length)
+            {
+                int regularID = itemID - Core.BULK_ID_BASE + Core.MOD_ID_BASE;
+                if (!ModuleRegistry.TryGet(regularID, out var bulkEntry)) return null;
+                if ((int)itemType != 9) return null;
+
+                MelonCoroutines.Start(Core.BulkUpgradeScanner());
+                return Core.BuildBulkBoxPrefab(mgm, itemID, bulkEntry, templateParent);
+            }
+
+            if (!ModuleRegistry.TryGet(itemID, out var entry)) return null;
+
+            if ((int)itemType == 9)
+                return Core.BuildBoxPrefab(mgm, itemID, entry, templateParent);
+            if ((int)itemType == 8)
+                return Core.BuildModulePrefab(mgm, itemID, entry, templateParent);
+
+            return null;
+        }
+    }
+
+    // =========================================================================
     // Patch: ComputerShop.GetPrefabForItem (Prefix)
     // Routes our custom itemID to the correct prefab when the player buys from
     // the shop. Handles both SFPBox (type 9) and bare SFPModule (type 8).
@@ -63,6 +197,7 @@ namespace MoreSFPModules
                 int regularID = itemID - Core.BULK_ID_BASE + Core.MOD_ID_BASE;
                 if (ModuleRegistry.TryGet(regularID, out var bulkEntry) && (int)itemType == 9)
                 {
+                    MelonLogger.Msg($"GetPrefabForItem custom bulk: itemID={itemID}, regularID={regularID}");
                     __result = Core.BuildBulkBoxPrefab(mgm, itemID, bulkEntry);
                     MelonCoroutines.Start(Core.BulkUpgradeScanner());
                     return false;
@@ -75,11 +210,13 @@ namespace MoreSFPModules
             // ObjectInHand.SFPBox == 9, ObjectInHand.SFPModule == 8
             if ((int)itemType == 9)
             {
+                MelonLogger.Msg($"GetPrefabForItem custom box: itemID={itemID}");
                 __result = Core.BuildBoxPrefab(mgm, itemID, entry);
                 return false;
             }
             if ((int)itemType == 8)
             {
+                MelonLogger.Msg($"GetPrefabForItem custom module: itemID={itemID}");
                 __result = Core.BuildModulePrefab(mgm, itemID, entry);
                 return false;
             }
@@ -152,7 +289,7 @@ namespace MoreSFPModules
 
     // =========================================================================
     // Patch: SFPBox.CanAcceptSFP (Prefix)
-    // Our custom box uses sfpBoxType == prefabID (e.g. 100), but our modules
+    // Our custom box uses sfpBoxType == prefabID, but our modules
     // carry sfpType == vanilla QSFP+ type for port compatibility. Without this
     // patch the box would reject our module because the types don't match.
     // =========================================================================

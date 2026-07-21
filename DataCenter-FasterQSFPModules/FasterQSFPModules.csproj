@@ -60,6 +60,10 @@
       <HintPath>$(Il2CppAssembliesDir)\UnityEngine.UI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(Il2CppAssembliesDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
 
     <!-- Input System -->
     <Reference Include="Unity.InputSystem">

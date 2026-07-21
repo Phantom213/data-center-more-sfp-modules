@@ -2,9 +2,11 @@ using Il2Cpp;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using MelonLoader;
 using UnityEngine;
+using UnityEngine.UI;
 using System.Collections;
+using System.Collections.Generic;
 
-[assembly: MelonInfo(typeof(MoreSFPModules.Core), "FasterQSFPModules", "1.0.4", "leoms1408")]
+[assembly: MelonInfo(typeof(MoreSFPModules.Core), "FasterQSFPModules", "1.0.11", "leoms1408")]
 [assembly: MelonGame("Waseku", "Data Center")]
 
 namespace MoreSFPModules
@@ -25,20 +27,21 @@ namespace MoreSFPModules
         // MOD_ID_BASE: 5x box / bare module (also used as sfpBoxType / prefabID in save data).
         // BULK_ID_BASE: 32x box shop item — distinct ID so GetPrefabForItem can return a
         //               pre-expanded box without any post-delivery scanning.
-        internal const int MOD_ID_BASE  = 100;
-        internal const int BULK_ID_BASE = 200;
+        internal const int MOD_ID_BASE  = 1000;
+        internal const int BULK_ID_BASE = 2000;
 
         // Inactive holder for prefab templates — parenting templates here makes their
         // activeInHierarchy = false, so the game's UsableObject tracker ignores them.
         // Object.Instantiate still produces active clones from inactive-hierarchy objects.
         internal static GameObject TemplateHolder { get; private set; }
+        private static readonly Dictionary<int, int> ExtendedShopRowsByParent = new Dictionary<int, int>();
 
         // -----------------------------------------------------------------------
         // Scans vanilla sfpPrefabs to find the highest-speed module (QSFP+ 40G),
         // stores it as the clone source, then extends the sfpPrefabs array with
-        // one slot per custom module starting at MOD_ID_BASE (100).
+        // one slot per custom module starting at MOD_ID_BASE.
         //
-        // Starting at 100 instead of vanillaCount prevents prefabID collisions if
+        // Starting well above vanillaCount prevents prefabID collisions if
         // the game later adds new vanilla SFP types at indices 4, 5, 6 …
         //
         // Called from PatchMainGameManagerAwake — the earliest point where
@@ -185,8 +188,8 @@ namespace MoreSFPModules
         {
             if (root == null) return;
 
-            // prefabIDs start at MOD_ID_BASE (100) and map 1:1 to ModuleList.All.
-            int defIndex = prefabID - 100;
+            // prefabIDs start at MOD_ID_BASE and map 1:1 to ModuleList.All.
+            int defIndex = prefabID - MOD_ID_BASE;
             if (defIndex < 0 || defIndex >= ModuleList.All.Length) return;
             Color tint = ModuleList.All[defIndex].ModuleColor;
 
@@ -223,7 +226,8 @@ namespace MoreSFPModules
         // so the player receives the correct module when unboxing.
         // -----------------------------------------------------------------------
         internal static GameObject BuildBoxPrefab(MainGameManager mgm, int prefabID,
-                                                  ModuleRegistry.Entry entry)
+                                                  ModuleRegistry.Entry entry,
+                                                  Transform parent = null)
         {
             var boxPrefabs = mgm.sfpsBoxedPrefab;
             if (boxPrefabs == null) return null;
@@ -243,7 +247,9 @@ namespace MoreSFPModules
                 return null;
             }
 
-            var clone = Object.Instantiate(baseBox);
+            var clone = parent != null
+                ? Object.Instantiate(baseBox, parent, false)
+                : Object.Instantiate(baseBox);
             clone.name = $"SFPBox_custom_{prefabID}";
 
             var sfpBox = clone.GetComponent<SFPBox>();
@@ -315,15 +321,17 @@ namespace MoreSFPModules
                 yield break;
             }
 
-            var shopParent = computerShop.shopItemParent;
-            if (shopParent == null) { LoggerInstance.Warning("shopItemParent null."); yield break; }
+            var shopRoot = computerShop.shopItemParent;
+            if (shopRoot == null) { LoggerInstance.Warning("shopItemParent null."); yield break; }
 
             // Target the "HL Mods" section inside VL-ShopItems so our items appear
             // in the correct category rather than being appended at the end.
-            var modsTransform = shopParent.transform.Find("HL Mods");
-            if (modsTransform != null)
-                shopParent = modsTransform.gameObject;
-            else
+            var sfpParent = sourceItem.transform.parent != null
+                ? sourceItem.transform.parent.gameObject
+                : shopRoot;
+
+            var customRows = EnsureCustomSfpRows(shopRoot, sfpParent, ModuleList.All.Length);
+            if (customRows.Count < 0)
                 LoggerInstance.Warning("'HL Mods' not found — falling back to shopItemParent.");
 
             float itemHeight = 0f;
@@ -331,43 +339,203 @@ namespace MoreSFPModules
             if (sourceRt != null)
                 itemHeight = sourceRt.rect.height;
 
-            int addedCount = 0;
-            int basePrice  = sourceItem.shopItemSO.price;
+            int addedSfpCount  = 0;
+            int basePrice      = sourceItem.shopItemSO.price;
 
             for (int i = 0; i < ModuleList.All.Length; i++)
             {
                 var def      = ModuleList.All[i];
-                int prefabID = 100 + i;
+                int prefabID = MOD_ID_BASE + i;
                 if (!ModuleRegistry.TryGet(prefabID, out _)) continue;
 
                 // 5x shop button (standard)
-                string label5 = $"5x {def.DisplayName}";
+                string label5 = BuildShopLabel("5x", def);
                 int price5    = (int)(basePrice * def.PriceMultiplier);
-                var added5    = AddShopButton(sourceItem, shopParent, prefabID,
+                var rowParent = customRows.Count > 0
+                    ? customRows[Mathf.Min(i / 4, customRows.Count - 1)]
+                    : sfpParent;
+                var added5    = AddShopButton(computerShop, sourceItem, rowParent, prefabID,
                                               label5, price5, def.XpToUnlock, def.ShopGuid);
-                if (added5 != null) addedCount++;
+                if (added5 != null) addedSfpCount++;
 
                 // 32x shop button — uses BULK_ID_BASE + i so GetPrefabForItem can
                 // distinguish this from the 5x item and return a pre-expanded 32-slot box.
-                string label32 = $"32x {def.DisplayName}";
-                int price32    = (int)(basePrice * def.PriceMultiplier * 32f / 5f);
-                var added32    = AddShopButton(sourceItem, shopParent, BULK_ID_BASE + i,
-                                               label32, price32, def.XpToUnlock,
-                                               def.ShopGuid + "_32x");
-                if (added32 != null) addedCount++;
             }
+
+            EnsureBackplaneTopSpacer(computerShop, shopRoot, sfpParent, itemHeight);
 
             // The HL Mods container has a fixed height — extend it so the ScrollRect
             // can scroll far enough to reveal our newly added items.
-            var containerRt = shopParent.GetComponent<UnityEngine.RectTransform>();
-            if (containerRt != null && itemHeight > 0f && addedCount > 0)
+            ExtendVerticalContainer(shopRoot, itemHeight, customRows.Count);
+
+            RebuildShopLayout(shopRoot);
+        }
+
+        private static System.Collections.Generic.List<GameObject> EnsureCustomSfpRows(GameObject shopRoot,
+                                                                                       GameObject templateRow,
+                                                                                       int itemCount)
+        {
+            var rows = new System.Collections.Generic.List<GameObject>();
+            if (shopRoot == null || templateRow == null) return rows;
+
+            int rowCount = Mathf.CeilToInt(itemCount / 4f);
+            int insertIndex = templateRow.transform.GetSiblingIndex() + 1;
+
+            for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
             {
-                var sd = containerRt.sizeDelta;
-                sd.y += itemHeight * addedCount;
-                containerRt.sizeDelta = sd;
+                string rowName = $"HL FasterQSFP {rowIndex + 1}";
+                var existing = shopRoot.transform.Find(rowName);
+                GameObject row = existing != null ? existing.gameObject : null;
+
+                if (row == null)
+                {
+                    row = Object.Instantiate(templateRow, shopRoot.transform, false);
+                    row.name = rowName;
+                    ClearRowChildren(row);
+                }
+
+                row.transform.SetSiblingIndex(insertIndex + rowIndex);
+                row.SetActive(true);
+                rows.Add(row);
             }
 
-            UnityEngine.Canvas.ForceUpdateCanvases();
+            return rows;
+        }
+
+        private static void ClearRowChildren(GameObject row)
+        {
+            if (row == null) return;
+
+            for (int i = row.transform.childCount - 1; i >= 0; i--)
+            {
+                var child = row.transform.GetChild(i);
+                child.SetParent(null, false);
+                Object.Destroy(child.gameObject);
+            }
+        }
+
+        private static string BuildShopLabel(string quantity, ModuleDefinition def)
+        {
+            string speed = $"{def.SpeedGbps:0}Gbps";
+            string moduleName = def.DisplayName;
+            if (moduleName.EndsWith(speed))
+                moduleName = moduleName.Substring(0, moduleName.Length - speed.Length).TrimEnd();
+
+            return $"{quantity} {moduleName} Module Fiber {speed}";
+        }
+
+        private static void ExtendVerticalContainer(GameObject parent, float itemHeight, int addedRows)
+        {
+            if (parent == null || itemHeight <= 0f || addedRows <= 0) return;
+
+            var containerRt = parent.GetComponent<UnityEngine.RectTransform>();
+            if (containerRt == null) return;
+
+            int instanceId = parent.GetInstanceID();
+            ExtendedShopRowsByParent.TryGetValue(instanceId, out int alreadyAddedRows);
+            int rowsToAdd = addedRows - alreadyAddedRows;
+            if (rowsToAdd <= 0) return;
+
+            var sd = containerRt.sizeDelta;
+            sd.y += itemHeight * rowsToAdd;
+            containerRt.sizeDelta = sd;
+            ExtendedShopRowsByParent[instanceId] = addedRows;
+        }
+
+        private static void EnsureBackplaneTopSpacer(ComputerShop computerShop,
+                                                     GameObject shopRoot,
+                                                     GameObject templateRow,
+                                                     float itemHeight)
+        {
+            if (shopRoot == null || templateRow == null) return;
+            if (!HasBoostedSystemXItems(computerShop) && !IsBackplaneBoostServersLoaded()) return;
+
+            const string spacerName = "HL Backplane Top Padding";
+            var existing = shopRoot.transform.Find(spacerName);
+            GameObject spacer = existing != null ? existing.gameObject : null;
+
+            if (spacer == null)
+            {
+                spacer = Object.Instantiate(templateRow, shopRoot.transform, false);
+                spacer.name = spacerName;
+                ClearRowChildren(spacer);
+                MelonLogger.Msg("Added Backplane shop top padding for clipped SystemX server row.");
+            }
+
+            float height = Mathf.Max(160f, itemHeight * 0.7f);
+
+            spacer.transform.SetSiblingIndex(0);
+            spacer.SetActive(true);
+
+            var rt = spacer.GetComponent<RectTransform>();
+            if (rt != null)
+            {
+                var sd = rt.sizeDelta;
+                sd.y = height;
+                rt.sizeDelta = sd;
+            }
+
+            var layout = spacer.GetComponent<LayoutElement>();
+            if (layout == null)
+                layout = spacer.AddComponent<LayoutElement>();
+
+            layout.ignoreLayout = false;
+            layout.minHeight = height;
+            layout.preferredHeight = height;
+            layout.flexibleHeight = 0f;
+        }
+
+        private static bool HasBoostedSystemXItems(ComputerShop computerShop)
+        {
+            var items = computerShop?.shopItems;
+            if (items == null) return false;
+
+            foreach (var item in items)
+            {
+                if (item == null) continue;
+
+                string name = item.itemDisplayName;
+                if (string.IsNullOrEmpty(name) && item.txtName != null)
+                    name = item.txtName.text;
+                if (string.IsNullOrEmpty(name)) continue;
+
+                if (name.Contains("SystemX") &&
+                    (name.Contains("125K") || name.Contains("500K")))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsBackplaneBoostServersLoaded()
+        {
+            foreach (var assembly in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var name = assembly.GetName().Name;
+                if (string.IsNullOrEmpty(name)) continue;
+                if (name.Contains("BackplaneBoostServers") ||
+                    name.Contains("DataCenterAutomatorServers"))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void RebuildShopLayout(GameObject shopRoot)
+        {
+            if (shopRoot == null) return;
+
+            Canvas.ForceUpdateCanvases();
+
+            var contentRt = shopRoot.GetComponent<RectTransform>();
+            if (contentRt != null)
+                LayoutRebuilder.ForceRebuildLayoutImmediate(contentRt);
+
+            var scrollRect = shopRoot.GetComponentInParent<ScrollRect>();
+            if (scrollRect != null)
+                scrollRect.verticalNormalizedPosition = 1f;
+
+            Canvas.ForceUpdateCanvases();
         }
 
         // -----------------------------------------------------------------------
@@ -375,9 +543,16 @@ namespace MoreSFPModules
         // the custom module's name/price/ID, and adds it to the given parent.
         // Returns the created GameObject, or null if the ShopItem component is missing.
         // -----------------------------------------------------------------------
-        private static GameObject AddShopButton(ShopItem source, GameObject parent, int prefabID,
+        private static GameObject AddShopButton(ComputerShop computerShop, ShopItem source,
+                                               GameObject parent, int prefabID,
                                                string label, int price, int xpToUnlock, string guid)
         {
+            string objectName = $"ShopItem_{label.Replace(" ", "_").Replace("/", "_")}";
+            if (parent.transform.Find(objectName) != null)
+                return null;
+
+            bool alreadyRegistered = ShopItemAlreadyRegistered(computerShop, prefabID, guid);
+
             var newSO = ScriptableObject.CreateInstance<ShopItemSO>();
             newSO.itemName   = label;
             newSO.price      = price;
@@ -385,10 +560,11 @@ namespace MoreSFPModules
             newSO.itemType   = source.shopItemSO.itemType; // SFPBox (9)
             newSO.itemID     = prefabID;
             newSO.eol        = source.shopItemSO.eol;
+            newSO.isCustomColor = source.shopItemSO.isCustomColor;
             newSO.sprite     = BaseQsfpSprite;
 
             var cloned = Object.Instantiate(source.gameObject, parent.transform, false);
-            cloned.name = $"ShopItem_{label.Replace(" ", "_")}";
+            cloned.name = objectName;
             cloned.transform.localPosition = Vector3.zero;
             cloned.transform.localScale    = Vector3.one;
 
@@ -402,10 +578,55 @@ namespace MoreSFPModules
 
             shopItem.shopItemSO = newSO;
             shopItem.guid       = guid;
+            shopItem.itemDisplayName = label;
+            shopItem.isUnlocked = true;
+
+            if (shopItem.txtName != null)
+                shopItem.txtName.text = label;
+            if (shopItem.txtPrice != null)
+                shopItem.txtPrice.text = $"{price} $";
+            if (shopItem.txtXpToUnlock != null)
+                shopItem.txtXpToUnlock.text = "";
+            if (shopItem.unlockButton != null)
+                shopItem.unlockButton.SetActive(false);
+            if (shopItem.itemIcon != null && BaseQsfpSprite != null)
+                shopItem.itemIcon.sprite = BaseQsfpSprite;
+
+            if (!alreadyRegistered)
+                RegisterShopItem(computerShop, shopItem);
             cloned.SetActive(true);
 
-            MelonLogger.Msg($"Shop button added: '{newSO.itemName}' (prefabID={prefabID}, price={newSO.price})");
+            MelonLogger.Msg($"Shop button added: '{newSO.itemName}' " +
+                            $"(prefabID={prefabID}, price={newSO.price}, parent={parent.name})");
             return cloned;
+        }
+
+        private static bool ShopItemAlreadyRegistered(ComputerShop computerShop, int prefabID, string guid)
+        {
+            var items = computerShop?.shopItems;
+            if (items == null) return false;
+
+            foreach (var item in items)
+            {
+                if (item == null) continue;
+                if (item.guid == guid) return true;
+                if (item.shopItemSO != null && item.shopItemSO.itemID == prefabID)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void RegisterShopItem(ComputerShop computerShop, ShopItem shopItem)
+        {
+            var oldItems = computerShop?.shopItems;
+            if (oldItems == null || shopItem == null) return;
+
+            var newItems = new Il2CppReferenceArray<ShopItem>(oldItems.Length + 1);
+            for (int i = 0; i < oldItems.Length; i++)
+                newItems[i] = oldItems[i];
+            newItems[oldItems.Length] = shopItem;
+            computerShop.shopItems = newItems;
         }
 
         // -----------------------------------------------------------------------
@@ -415,10 +636,11 @@ namespace MoreSFPModules
         // after instantiation, so upgrading at prefab time has no effect.
         // -----------------------------------------------------------------------
         internal static GameObject BuildBulkBoxPrefab(MainGameManager mgm, int bulkItemID,
-                                                      ModuleRegistry.Entry entry)
+                                                      ModuleRegistry.Entry entry,
+                                                      Transform parent = null)
         {
             int regularPrefabID = bulkItemID - BULK_ID_BASE + MOD_ID_BASE;
-            var box = BuildBoxPrefab(mgm, regularPrefabID, entry);
+            var box = BuildBoxPrefab(mgm, regularPrefabID, entry, parent);
             if (box == null) return null;
 
             // Mark with distinctive name so the scanner can identify it.
