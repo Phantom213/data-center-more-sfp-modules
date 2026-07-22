@@ -20,7 +20,6 @@ This mod adds faster QSFP modules to Data Center.
 
 - Buyable from the **shop** like any vanilla module
 - Fully compatible with QSFP+ switch ports
-- 32 module boxes available in the shop
 - **Color-coded modules** — each tier gets its own tint so you can tell them apart at a glance
 - **Save/load persistent** — modules installed in switch ports survive game restarts
 
